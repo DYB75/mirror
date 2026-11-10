@@ -1,0 +1,125 @@
+name: Build Eden Galaxy Tab S9 Edition (Auto-Patch & Sign)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gos_bypass:
+        description: 'Activer le contournement Samsung GOS (com.miHoYo.Yuanshen)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+  push:
+    branches: [ main, master, tabs9 ]
+
+jobs:
+  build-tabs9-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 1. Récupération du code source Eden et des sous-modules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 2. Application automatique des optimisations Galaxy Tab S9 (Snapdragon 8 Gen 2 / Adreno 740)
+        env:
+          GOS_BYPASS: ${{ github.event.inputs.gos_bypass }}
+        run: |
+          python3 - << 'EOF'
+          import os, re
+          from pathlib import Path
+
+          gos_bypass = os.environ.get("GOS_BYPASS", "false") == "true"
+          app_id = "com.miHoYo.Yuanshen" if gos_bypass else "dev.eden.eden_emulator.tabs9"
+
+          # 1. Patch Gradle (Drapeaux ARMv9-A Cortex-X3 + ThinLTO + Application ID)
+          for g_file in ["src/android/app/build.gradle.kts", "src/android/app/build.gradle"]:
+              p = Path(g_file)
+              if p.exists():
+                  txt = p.read_text(encoding="utf-8")
+                  flags = (
+                      '"-DCMAKE_C_FLAGS_RELEASE=-O3 -march=armv9-a+sve2+i8mm+fp16+dotprod+crypto -mtune=cortex-x3 -flto=thin -fomit-frame-pointer",\n'
+                      '                    "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -march=armv9-a+sve2+i8mm+fp16+dotprod+crypto -mtune=cortex-x3 -flto=thin -fomit-frame-pointer",'
+                  )
+                  if "-mtune=cortex-x3" not in txt and "arguments(" in txt:
+                      txt = txt.replace("arguments(", f"arguments(\n                    {flags}", 1)
+                  txt = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{app_id}"', txt, count=1)
+                  p.write_text(txt, encoding="utf-8")
+                  print(f"[OK] {g_file} patché avec ARMv9-A/Cortex-X3 et ID={app_id}")
+
+          # 2. Patch Settings (NCE, ASTC GPU, 16:10 pour dalle 2560x1600)
+          s_path = Path("src/common/settings.h")
+          if s_path.exists():
+              stxt = s_path.read_text(encoding="utf-8")
+              stxt = stxt.replace("CpuBackend::Dynarmic", "CpuBackend::Nce")
+              stxt = stxt.replace("AstcDecodeMode::Cpu", "AstcDecodeMode::Gpu")
+              stxt = stxt.replace("AspectRatio::R16_9", "AspectRatio::R16_10")
+              s_path.write_text(stxt, encoding="utf-8")
+              print("[OK] src/common/settings.h optimisé (NCE + ASTC GPU + 16:10)")
+
+          # 3. Patch Adreno 740 UBWC MSAA Anti-Freeze
+          vk_path = Path("src/video_core/renderer_vulkan/vk_texture_cache.cpp")
+          if vk_path.exists():
+              vtxt = vk_path.read_text(encoding="utf-8")
+              if "VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT" not in vtxt and "return image_ci;" in vtxt:
+                  patch_code = """
+              VkImageCompressionControlEXT compression_control{
+                  .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
+                  .pNext = nullptr,
+                  .flags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT,
+                  .compressionControlPlaneCount = 0,
+                  .pFixedRateFlags = nullptr,
+              };
+              if (image_ci.samples != VK_SAMPLE_COUNT_1_BIT &&
+                  device.IsExtImageCompressionControlSupported()) {
+                  compression_control.pNext = image_ci.pNext;
+                  image_ci.pNext = &compression_control;
+              }
+              return image_ci;"""
+                  vtxt = vtxt.replace("return image_ci;", patch_code, 1)
+                  vk_path.write_text(vtxt, encoding="utf-8")
+                  print("[OK] Correctif UBWC Adreno 740 injecté dans vk_texture_cache.cpp")
+          EOF
+
+      - name: 3. Configuration de JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 4. Configuration du SDK Android & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Installation des outils de compilation CMake / Ninja / GLSL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build glslang-tools spirv-tools ccache
+
+      - name: 6. Compilation du binaire APK (Release ARM64-v8a / ARMv9-A)
+        working-directory: src/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease -Pandroid.injected.abi=arm64-v8a --no-daemon
+
+      - name: 7. Signature automatique de l'APK (Prêt à installer sur Galaxy Tab S9)
+        working-directory: src/android
+        run: |
+          keytool -genkey -v -keystore tabs9.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias tabs9 -storepass tabs9pass -keypass tabs9pass \
+            -dname "CN=EdenTabS9, OU=Android, O=EdenFork, L=Paris, S=IDF, C=FR"
+
+          UNSIGNED_APK=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | tail -n 1)
+
+          $BUILD_TOOLS_DIR/zipalign -v -p 4 "$UNSIGNED_APK" app-aligned.apk
+          $BUILD_TOOLS_DIR/apksigner sign --ks tabs9.jks --ks-pass pass:tabs9pass \
+            --key-pass pass:tabs9pass --out Eden-Galaxy-Tab-S9-Signed.apk app-aligned.apk
+
+      - name: 8. Publication de l'APK signé en téléchargement
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Galaxy-Tab-S9-APK
+          path: src/android/Eden-Galaxy-Tab-S9-Signed.apk
